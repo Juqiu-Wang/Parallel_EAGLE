@@ -1,6 +1,7 @@
 import copy
 import json
 import time
+from typing import Optional, List, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,6 +78,29 @@ class EaModel(nn.Module):
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
+        # ============ Early Prediction Configuration ============
+        self.use_early_prediction = getattr(config, 'use_early_prediction', False)
+        self.ea_config = config
+        
+        if self.use_early_prediction:
+            # Get target model's number of layers
+            self.num_target_layers = len(self.base_model.model.layers)
+            
+            # Calculate layer indices for auxiliary hidden states extraction
+            # Default: layer 1, layer 1/4, layer 3/4
+            aux_ratios = getattr(config, 'aux_hidden_layers_ratio', [0.03125, 0.25, 0.75])
+            self.aux_hidden_layer_indices = [
+                max(1, int(self.num_target_layers * ratio)) for ratio in aux_ratios
+            ]
+            
+            # Calculate early exit layer index (default 3/4)
+            early_exit_ratio = getattr(config, 'early_exit_layer_ratio', 0.75)
+            self.early_exit_layer_idx = int(self.num_target_layers * early_exit_ratio)
+            
+            # Early prediction top-k
+            self.early_prediction_top_k = getattr(config, 'early_prediction_top_k', 5)
+        # ============ End Early Prediction Configuration ============
+
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
 
@@ -84,6 +108,26 @@ class EaModel(nn.Module):
             Tokenizer: The tokenizer of the base model.
         """
         return self.tokenizer
+
+    def get_aux_hidden_layer_indices(self) -> List[int]:
+        """Get the layer indices for auxiliary hidden states extraction.
+        
+        Returns:
+            List[int]: List of layer indices to extract hidden states from.
+        """
+        if self.use_early_prediction:
+            return self.aux_hidden_layer_indices
+        return None
+
+    def get_early_exit_layer_idx(self) -> int:
+        """Get the early exit layer index.
+        
+        Returns:
+            int: The layer index for early exit.
+        """
+        if self.use_early_prediction:
+            return self.early_exit_layer_idx
+        return None
 
     @classmethod
     def from_pretrained(
@@ -97,7 +141,7 @@ class EaModel(nn.Module):
             threshold=1.0,
             **kwargs,
     ):
-        # assert Type=="LLaMA" or "Mixtral"
+        # ... existing code ...
         Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
 
         if Type == 'LlamaForCausalLM':
@@ -176,8 +220,31 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            aux_hidden_layer_indices: Optional[List[int]] = None,
+            early_exit_layer_idx: Optional[int] = None,
+            start_layer_idx: int = 0,
+            initial_hidden_states: Optional[torch.FloatTensor] = None,
     ):
-
+        """
+        Forward pass through target model with optional early prediction support.
+        
+        Args:
+            input_ids: Input token ids
+            attention_mask: Attention mask
+            past_key_values: Cached key values
+            output_orig: Whether to output original logits
+            position_ids: Position ids
+            aux_hidden_layer_indices: Layer indices to extract auxiliary hidden states (for early prediction)
+            early_exit_layer_idx: Layer index to early exit (for early prediction Step A)
+            start_layer_idx: Layer index to start from (for continuing from early exit)
+            initial_hidden_states: Initial hidden states (for continuing from early exit)
+            
+        Returns:
+            If early_exit_layer_idx is set:
+                (outputs, hidden_states, aux_hidden_states_dict)
+            Otherwise:
+                Standard return based on output_orig flag
+        """
         with torch.inference_mode():
             # Pass input through the base model
             outputs = self.base_model.model(
@@ -185,16 +252,180 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                aux_hidden_layer_indices=aux_hidden_layer_indices,
+                early_exit_layer_idx=early_exit_layer_idx,
+                start_layer_idx=start_layer_idx,
+                initial_hidden_states=initial_hidden_states,
             )
-            if output_orig:
-                orig = self.base_model.lm_head(outputs[0])
+            
             hidden_states = outputs[0]
+            
+            # Check if this is an early exit (no final norm applied, no logits needed yet)
+            is_early_exit = (early_exit_layer_idx is not None and 
+                           hasattr(outputs, 'early_exit_layer_idx') and 
+                           outputs.early_exit_layer_idx is not None)
+            
+            if is_early_exit:
+                # Return early exit results with auxiliary hidden states
+                aux_hidden_states = getattr(outputs, 'aux_hidden_states', {})
+                return outputs, hidden_states, aux_hidden_states
+            
+            # Standard forward: compute logits if needed
+            if output_orig:
+                orig = self.base_model.lm_head(hidden_states)
+                return outputs, orig, hidden_states
+            else:
+                return outputs, hidden_states
 
-        if output_orig:
-            return outputs, orig, hidden_states
-        else:
-            return outputs, hidden_states
+    def forward_early_exit(
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values=None,
+            position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Dict[int, torch.FloatTensor], any]:
+        """
+        Run target model to early exit layer (Step A).
+        
+        This method runs the target model forward pass only up to the early exit layer
+        (default 3/4 of total layers), and extracts auxiliary hidden states from
+        specified layers for feature fusion.
+        
+        Args:
+            input_ids: Input token ids (batch, seq_len)
+            attention_mask: Attention mask
+            past_key_values: Cached key values
+            position_ids: Position ids
+            
+        Returns:
+            Tuple of:
+                - early_exit_hidden: Hidden states at early exit layer (batch, seq_len, hidden_size)
+                - aux_hidden_states: Dict of {layer_idx: hidden_states} for feature fusion
+                - outputs: Model outputs containing past_key_values etc.
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled. Set use_early_prediction=True in config.")
+        
+        with torch.inference_mode():
+            outputs = self.base_model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                aux_hidden_layer_indices=self.aux_hidden_layer_indices,
+                early_exit_layer_idx=self.early_exit_layer_idx,
+            )
+            
+            early_exit_hidden = outputs.early_exit_hidden_state
+            aux_hidden_states = outputs.aux_hidden_states
+            
+            return early_exit_hidden, aux_hidden_states, outputs
 
+    def forward_continue(
+            self,
+            early_exit_hidden: torch.FloatTensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values=None,
+            position_ids: Optional[torch.LongTensor] = None,
+            output_logits: bool = True,
+    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor], any]:
+        """
+        Continue target model from early exit layer to final layer (Step E).
+        
+        This method continues the target model forward pass from the early exit layer
+        to the final layer, used for verification after drafting is complete.
+        
+        Args:
+            early_exit_hidden: Hidden states from early exit layer
+            attention_mask: Attention mask
+            past_key_values: Cached key values (should contain KV up to early exit layer)
+            position_ids: Position ids
+            output_logits: Whether to compute and return logits
+            
+        Returns:
+            Tuple of:
+                - hidden_states: Final hidden states (batch, seq_len, hidden_size)
+                - logits: LM head logits if output_logits=True, else None
+                - outputs: Model outputs containing updated past_key_values
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled. Set use_early_prediction=True in config.")
+        
+        with torch.inference_mode():
+            # Continue from early exit layer
+            outputs = self.base_model.model(
+                input_ids=None,  # Not needed when continuing
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                start_layer_idx=self.early_exit_layer_idx,
+                initial_hidden_states=early_exit_hidden,
+            )
+            
+            hidden_states = outputs[0]
+            
+            logits = None
+            if output_logits:
+                logits = self.base_model.lm_head(hidden_states)
+            
+            return hidden_states, logits, outputs
+
+    def early_prediction_draft(
+            self,
+            early_exit_hidden: torch.FloatTensor,
+            aux_hidden_states: Dict[int, torch.FloatTensor],
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Execute early prediction and draft model (Steps B, C, D).
+        
+        This method:
+        1. Step B: Run early prediction to get top-k candidates
+        2. Step C: Feature fusion (concatenate layer hidden states)
+        3. Step D: Run draft model to generate subsequent tokens
+        
+        Args:
+            early_exit_hidden: Hidden states from early exit (3/4) layer
+            aux_hidden_states: Dict of auxiliary hidden states {layer_idx: tensor}
+            attention_mask: Attention mask for early prediction transformer
+            position_ids: Position ids
+            
+        Returns:
+            Tuple of:
+                - early_topk_indices: Top-k token indices from early prediction (batch, seq_len, k)
+                - early_topk_probs: Top-k log probabilities (batch, seq_len, k)
+                - early_transformer_hidden: Hidden states after early transformer (for feature fusion)
+                - fused_hidden: Fused hidden states ready for draft model
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled.")
+        
+        # Step B: Early Prediction
+        early_logits, early_transformer_hidden = self.ea_layer.early_prediction_forward(
+            early_hidden_states=early_exit_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        
+        # Get top-k candidates
+        early_topk_indices, early_topk_probs = self.ea_layer.get_early_top_k_candidates(
+            early_logits, 
+            top_k=self.early_prediction_top_k
+        )
+        
+        # Step C: Feature Fusion
+        # Concatenate auxiliary hidden states: [layer1, layer1/4, layer3/4]
+        sorted_indices = sorted(aux_hidden_states.keys())
+        aux_hidden_list = [aux_hidden_states[idx] for idx in sorted_indices]
+        concatenated_aux = torch.cat(aux_hidden_list, dim=-1)
+        
+        # Concatenate with early transformer hidden: [aux, early_transformer_hidden]
+        fused_hidden = torch.cat([concatenated_aux, early_transformer_hidden], dim=-1)
+        
+        return early_topk_indices, early_topk_probs, early_transformer_hidden, fused_hidden
+
+    # ... existing code ...
     @torch.no_grad()
     def eagenerate(
             self,
