@@ -19,6 +19,8 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
+from dataclasses import dataclass
+from typing import Dict
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import (
     add_start_docstrings,
@@ -32,6 +34,46 @@ from transformers import LlamaConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+
+@dataclass
+class BaseModelOutputWithPastAndAuxHiddenStates(BaseModelOutputWithPast):
+    """
+    Extended BaseModelOutputWithPast that includes auxiliary hidden states for early prediction.
+    
+    Args:
+        last_hidden_state: Sequence of hidden-states at the output of the last layer.
+        past_key_values: Tuple of pre-computed hidden-states (key and values).
+        hidden_states: Tuple of hidden-states of the model at the output of each layer.
+        attentions: Tuple of attention weights.
+        aux_hidden_states: Dictionary of auxiliary hidden states at specified layers.
+            Keys are layer indices, values are the hidden states at those layers.
+        early_exit_hidden_state: Hidden state at the early exit layer (for early prediction).
+        early_exit_layer_idx: The layer index where early exit occurred.
+    """
+    aux_hidden_states: Optional[Dict[int, torch.FloatTensor]] = None
+    early_exit_hidden_state: Optional[torch.FloatTensor] = None
+    early_exit_layer_idx: Optional[int] = None
+
+
+@dataclass
+class CausalLMOutputWithPastAndAuxHiddenStates(CausalLMOutputWithPast):
+    """
+    Extended CausalLMOutputWithPast that includes auxiliary hidden states for early prediction.
+    
+    Args:
+        loss: Language modeling loss.
+        logits: Prediction scores of the language modeling head.
+        past_key_values: Tuple of pre-computed hidden-states (key and values).
+        hidden_states: Tuple of hidden-states of the model at the output of each layer.
+        attentions: Tuple of attention weights.
+        aux_hidden_states: Dictionary of auxiliary hidden states at specified layers.
+        early_exit_hidden_state: Hidden state at the early exit layer.
+        early_exit_layer_idx: The layer index where early exit occurred.
+    """
+    aux_hidden_states: Optional[Dict[int, torch.FloatTensor]] = None
+    early_exit_hidden_state: Optional[torch.FloatTensor] = None
+    early_exit_layer_idx: Optional[int] = None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -1054,7 +1096,12 @@ class LlamaModel(LlamaPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+            # [MODIFIED] Early prediction parameters
+            aux_hidden_layer_indices: Optional[List[int]] = None,
+            early_exit_layer_idx: Optional[int] = None,
+            start_layer_idx: int = 0,
+            initial_hidden_states: Optional[torch.FloatTensor] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast, BaseModelOutputWithPastAndAuxHiddenStates]:
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -1120,7 +1167,11 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values_length,
         )
 
-        hidden_states = inputs_embeds
+        # [MODIFIED] Support continuing from a specific layer with provided hidden states
+        if initial_hidden_states is not None and start_layer_idx > 0:
+            hidden_states = initial_hidden_states
+        else:
+            hidden_states = inputs_embeds
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -1130,13 +1181,38 @@ class LlamaModel(LlamaPreTrainedModel):
                 use_cache = False
 
         # decoder layers
-        all_hidden_states = () if 1 else None
+        all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        
+        # [MODIFIED] Initialize auxiliary hidden states dictionary for early prediction
+        aux_hidden_states_dict = {} if aux_hidden_layer_indices else None
+        early_exit_hidden = None
+        actual_early_exit_layer = None
+        
+        # [MODIFIED] Get total number of layers
+        num_layers = len(self.layers)
 
         for idx, decoder_layer in enumerate(self.layers):
-            if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
-                all_hidden_states += (hidden_states,)
+            # [MODIFIED] Skip layers before start_layer_idx (for continuing from early exit)
+            if idx < start_layer_idx:
+                continue
+                
+            # [MODIFIED] Collect auxiliary hidden states at specified layers
+            # This replaces the legacy hardcoded behavior (idx == 2, num_layers // 2, num_layers - 3)
+            # Now supports flexible layer selection via aux_hidden_layer_indices parameter
+            if aux_hidden_layer_indices and idx in aux_hidden_layer_indices:
+                aux_hidden_states_dict[idx] = hidden_states.clone()
+            
+            # [MODIFIED] Collect all hidden states if output_hidden_states is True
+            # For backward compatibility: if aux_hidden_layer_indices is not provided,
+            # fall back to legacy behavior (layer 2, middle, and layer -3)
+            if output_hidden_states:
+                if aux_hidden_layer_indices is None:
+                    # Legacy behavior: collect at hardcoded layers for backward compatibility
+                    if idx == 2 or idx == num_layers // 2 or idx == num_layers - 3:
+                        all_hidden_states += (hidden_states,)
+                # Note: When aux_hidden_layer_indices is provided, use aux_hidden_states_dict instead
 
             past_key_value = (
                 past_key_values[idx] if past_key_values is not None else None
@@ -1175,6 +1251,22 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+            
+            # [MODIFIED] Early exit at specified layer for early prediction
+            if early_exit_layer_idx is not None and idx == early_exit_layer_idx - 1:
+                early_exit_hidden = hidden_states.clone()
+                actual_early_exit_layer = idx + 1  # 1-indexed
+                # Return early without final norm
+                next_cache = tuple(next_decoder_cache) if use_cache else None
+                return BaseModelOutputWithPastAndAuxHiddenStates(
+                    last_hidden_state=hidden_states,  # Not normalized
+                    past_key_values=next_cache,
+                    hidden_states=all_hidden_states if output_hidden_states else None,
+                    attentions=all_self_attns,
+                    aux_hidden_states=aux_hidden_states_dict,
+                    early_exit_hidden_state=early_exit_hidden,
+                    early_exit_layer_idx=actual_early_exit_layer,
+                )
 
         hidden_states = self.norm(hidden_states)
 
@@ -1192,6 +1284,19 @@ class LlamaModel(LlamaPreTrainedModel):
                 for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
                 if v is not None
             )
+        
+        # [MODIFIED] Return extended output with auxiliary hidden states if requested
+        if aux_hidden_layer_indices:
+            return BaseModelOutputWithPastAndAuxHiddenStates(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                aux_hidden_states=aux_hidden_states_dict,
+                early_exit_hidden_state=early_exit_hidden,
+                early_exit_layer_idx=actual_early_exit_layer,
+            )
+        
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1247,7 +1352,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+            # [MODIFIED] Early prediction parameters
+            aux_hidden_layer_indices: Optional[List[int]] = None,
+            early_exit_layer_idx: Optional[int] = None,
+            start_layer_idx: int = 0,
+            initial_hidden_states: Optional[torch.FloatTensor] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast, CausalLMOutputWithPastAndAuxHiddenStates]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1299,9 +1409,34 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            # [MODIFIED] Pass early prediction parameters
+            aux_hidden_layer_indices=aux_hidden_layer_indices,
+            early_exit_layer_idx=early_exit_layer_idx,
+            start_layer_idx=start_layer_idx,
+            initial_hidden_states=initial_hidden_states,
         )
+        
+        # [MODIFIED] Check if this is an early exit (no logits computation needed)
+        is_early_exit = (early_exit_layer_idx is not None and 
+                         hasattr(outputs, 'early_exit_layer_idx') and 
+                         outputs.early_exit_layer_idx is not None)
 
         hidden_states = outputs[0]
+        
+        # [MODIFIED] Skip logits computation for early exit
+        if is_early_exit:
+            # Return early exit output without logits
+            return CausalLMOutputWithPastAndAuxHiddenStates(
+                loss=None,
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                aux_hidden_states=outputs.aux_hidden_states,
+                early_exit_hidden_state=outputs.early_exit_hidden_state,
+                early_exit_layer_idx=outputs.early_exit_layer_idx,
+            )
+        
         if self.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(
                 self.vocab_size // self.pretraining_tp, dim=0
@@ -1331,6 +1466,19 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
+        
+        # [MODIFIED] Return extended output with auxiliary hidden states if available
+        if hasattr(outputs, 'aux_hidden_states') and outputs.aux_hidden_states:
+            return CausalLMOutputWithPastAndAuxHiddenStates(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                aux_hidden_states=outputs.aux_hidden_states,
+                early_exit_hidden_state=outputs.early_exit_hidden_state,
+                early_exit_layer_idx=outputs.early_exit_layer_idx,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,

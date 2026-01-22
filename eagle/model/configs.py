@@ -1,4 +1,6 @@
 from transformers.configuration_utils import PretrainedConfig
+
+
 class EConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
@@ -56,6 +58,21 @@ class EConfig(PretrainedConfig):
             these scaling strategies behave:
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
+        use_early_prediction (`bool`, *optional*, defaults to `False`):
+            Whether to use early prediction for speculative decoding optimization.
+            When enabled, the target model will exit early at a specified layer ratio,
+            and use a lightweight transformer for early token prediction.
+        early_exit_layer_ratio (`float`, *optional*, defaults to 0.75):
+            The ratio of layers at which the target model should exit early.
+            For example, 0.75 means exit at 3/4 of total layers.
+        early_prediction_top_k (`int`, *optional*, defaults to 5):
+            The number of top-k candidates to consider from early prediction.
+        aux_hidden_layers_ratio (`List[float]`, *optional*, defaults to [0.03125, 0.25, 0.75]):
+            The ratio of layers to extract auxiliary hidden states for feature fusion.
+            Default corresponds to approximately layer 1, layer 1/4, and layer 3/4
+            for a typical transformer architecture.
+        target_hidden_size (`int`, *optional*, defaults to None):
+            The hidden size of the target model. If None, it will be set to the same as hidden_size.
 
         Example:
 
@@ -93,6 +110,12 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
+        # Early prediction configuration
+        use_early_prediction=False,
+        early_exit_layer_ratio=0.75,
+        early_prediction_top_k=5,
+        aux_hidden_layers_ratio=None,
+        target_hidden_size=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -114,6 +137,14 @@ class EConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+
+        # Early prediction configuration
+        self.use_early_prediction = use_early_prediction
+        self.early_exit_layer_ratio = early_exit_layer_ratio
+        self.early_prediction_top_k = early_prediction_top_k
+        # Default aux hidden layers ratio: layer 1 (~0.03125 for 32 layers), layer 1/4, layer 3/4
+        self.aux_hidden_layers_ratio = aux_hidden_layers_ratio if aux_hidden_layers_ratio is not None else [0.03125, 0.25, 0.75]
+        self.target_hidden_size = target_hidden_size if target_hidden_size is not None else hidden_size
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -143,3 +174,32 @@ class EConfig(PretrainedConfig):
             )
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be an float > 1, got {rope_scaling_factor}")
+
+    def get_aux_hidden_layer_indices(self, target_num_layers: int) -> list:
+        """
+        Calculate the actual layer indices for auxiliary hidden states extraction
+        based on the target model's number of layers.
+        
+        Args:
+            target_num_layers: The total number of layers in the target model.
+            
+        Returns:
+            List of layer indices to extract hidden states from.
+        """
+        indices = []
+        for ratio in self.aux_hidden_layers_ratio:
+            idx = max(1, int(target_num_layers * ratio))  # At least layer 1
+            indices.append(idx)
+        return indices
+
+    def get_early_exit_layer_index(self, target_num_layers: int) -> int:
+        """
+        Calculate the layer index at which to perform early exit.
+        
+        Args:
+            target_num_layers: The total number of layers in the target model.
+            
+        Returns:
+            The layer index for early exit.
+        """
+        return int(target_num_layers * self.early_exit_layer_ratio)

@@ -384,6 +384,180 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+class LlamaAttentionSimple(nn.Module):
+    """
+    Simple attention layer for early prediction.
+    Unlike LlamaAttention which expects input of hidden_size * 2 (concat of input_emb and hidden_states),
+    this layer only takes hidden_states of hidden_size.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        # Note: input is hidden_size, not hidden_size * 2
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            if hasattr(self.config, "rope_theta"):
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=self.config.rope_theta
+                )
+            else:
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings
+                )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+class LlamaDecoderLayerSimple(nn.Module):
+    """
+    Simplified decoder layer for early prediction.
+    Unlike LlamaDecoderLayeremb which takes both input_emb and hidden_states (and concatenates them),
+    this layer only takes hidden_states.
+    Used for early prediction when target model runs to 3/4 layer.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaAttentionSimple(config=config)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: Optional[bool] = False,
+            use_cache: Optional[bool] = False,
+    ) -> torch.FloatTensor:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, hidden_size)`
+            attention_mask (`torch.FloatTensor`, *optional*): attention mask
+            position_ids (`torch.LongTensor`, *optional*): position ids
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+
 class LlamaDecoderLayeremb(nn.Module):
     def __init__(self, config, last=True):
         super().__init__()
@@ -478,13 +652,13 @@ def len_list(x, n):
 class Model(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
-        self.config=config
+        self.config = config
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.lm_head=nn.Linear(config.hidden_size,config.draft_vocab_size,bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
         if load_emb and not hasattr(config, "target_hidden_size"):
             from safetensors import safe_open
             import json
@@ -522,21 +696,43 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
-        # print("total_tokens",total_tokens)
-        # print("depth",depth)
-        # print("top_k",top_k)
-        # print("threshold",threshold)
         self.hidden_size = config.hidden_size
         self.midlayer = LlamaDecoderLayeremb(config)
-        if hasattr(config, "target_hidden_size"):
-            self.fc = nn.Linear(config.target_hidden_size * 3, self.hidden_size, bias=False)
+        
+        # ============ Feature Fusion Linear Layer ============
+        # Determine if we use early prediction mode
+        # In early prediction mode, fc takes 4 inputs:
+        #   - layer 1 hidden state (target_hidden_size)
+        #   - layer 1/4 hidden state (target_hidden_size) 
+        #   - layer 3/4 hidden state (target_hidden_size)
+        #   - early transformer output (draft hidden_size)
+        # In legacy mode, fc takes 3 inputs (all from target model layers)
+        self.use_early_prediction = getattr(config, 'use_early_prediction', False)
+        target_hidden_size = getattr(config, 'target_hidden_size', config.hidden_size)
+        
+        if self.use_early_prediction:
+            # 4 inputs: 3 target layers + 1 early transformer output
+            self.fc = nn.Linear(target_hidden_size * 3 + self.hidden_size, self.hidden_size, bias=False)
         else:
-            self.fc = nn.Linear(config.hidden_size * 3, self.hidden_size, bias=False)
-        self.norm=LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # Legacy mode: 3 target layers
+            self.fc = nn.Linear(target_hidden_size * 3, self.hidden_size, bias=False)
+        
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-        d2t=torch.zeros((config.draft_vocab_size),dtype=torch.long)
-        t2d=torch.zeros((config.vocab_size),dtype=torch.bool)
+        # ============ Early Prediction Components ============
+        if self.use_early_prediction:
+            # Early prediction projection: project single target layer to draft hidden size
+            self.early_fc = nn.Linear(target_hidden_size, self.hidden_size, bias=False)
+            # Early prediction transformer layer (simple, no concat with embedding)
+            self.early_transformer = LlamaDecoderLayerSimple(config)
+            # Early prediction norm and LM head
+            self.early_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.early_lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+        # ============ End Early Prediction Components ============
+
+        d2t = torch.zeros((config.draft_vocab_size), dtype=torch.long)
+        t2d = torch.zeros((config.vocab_size), dtype=torch.bool)
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
 
@@ -634,12 +830,10 @@ class Model(nn.Module):
         #    if use_cache:
         #        use_cache = False
 
-        # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-        if hidden_states.shape[-1]!=inputs_embeds.shape[-1]:
+        # Project hidden states if dimension mismatch (feature fusion)
+        if hidden_states.shape[-1] != inputs_embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
-        # hidden_states = self.fc(hidden_states)
-
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
 
@@ -662,6 +856,149 @@ class Model(nn.Module):
             return hidden_states, next_decoder_cache
 
         return hidden_states
+
+    # ============ Early Prediction Methods ============
+    def project_early_hidden_states(self, early_hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Project single-layer hidden states (from 3/4 layer) to draft model hidden size.
+        
+        Args:
+            early_hidden_states: (batch, seq_len, target_hidden_size) - single layer hidden states
+            
+        Returns:
+            projected: (batch, seq_len, draft_hidden_size) - projected hidden states
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled in config")
+        return self.early_fc(early_hidden_states)
+
+    def early_prediction_forward(
+            self,
+            early_hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Early prediction forward pass (Step B in the speculative decoding flow).
+        Takes single-layer hidden states (from 3/4 layer), projects them,
+        runs through early_transformer, and returns both logits and hidden states.
+        
+        Args:
+            early_hidden_states: (batch, seq_len, target_hidden_size) - from target model 3/4 layer
+            attention_mask: (batch, 1, seq_len, seq_len) - causal attention mask
+            position_ids: (batch, seq_len) - position ids
+            
+        Returns:
+            Tuple of:
+                - early_logits: (batch, seq_len, draft_vocab_size) - early prediction logits
+                - early_transformer_hidden: (batch, seq_len, draft_hidden_size) - for feature fusion
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled in config")
+            
+        batch_size, seq_length, _ = early_hidden_states.size()
+        device = early_hidden_states.device
+        
+        # Project to draft hidden size
+        hidden_states = self.project_early_hidden_states(early_hidden_states)
+        
+        # Generate position_ids if not provided
+        if position_ids is None:
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        
+        # Generate attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length), dtype=torch.bool, device=device
+            )
+            attention_mask = self._prepare_decoder_attention_mask(
+                attention_mask, (batch_size, seq_length), hidden_states, 0
+            )
+        
+        # Pass through early transformer
+        early_outputs = self.early_transformer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+        )
+        early_transformer_hidden = early_outputs[0]
+        
+        # Compute early logits
+        early_logits = self.early_lm_head(self.early_norm(early_transformer_hidden))
+        
+        return early_logits, early_transformer_hidden
+
+    def feature_fusion_forward(
+            self,
+            aux_hidden_states: torch.Tensor,
+            early_transformer_hidden: torch.Tensor,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            use_cache: Optional[bool] = None,
+    ):
+        """
+        Feature fusion forward pass (Step C and D in the speculative decoding flow).
+        Concatenates auxiliary hidden states with early transformer output,
+        projects them, and runs through the main draft model.
+        
+        Args:
+            aux_hidden_states: (batch, seq_len, target_hidden_size * 3) - concatenated layer 1, 1/4, 3/4 hidden states
+            early_transformer_hidden: (batch, seq_len, draft_hidden_size) - output from early_prediction_forward
+            input_ids: (batch, seq_len) - input token ids (predicted tokens)
+            attention_mask: attention mask
+            position_ids: position ids
+            past_key_values: cached key values
+            use_cache: whether to use cache
+            
+        Returns:
+            hidden_states or (hidden_states, next_decoder_cache) if use_cache
+        """
+        if not self.use_early_prediction:
+            raise RuntimeError("Early prediction is not enabled in config")
+        
+        # Concatenate: [layer1, layer1/4, layer3/4, early_transformer_hidden]
+        fused_hidden = torch.cat([aux_hidden_states, early_transformer_hidden], dim=-1)
+        
+        # Use standard forward with fused hidden states
+        return self.forward(
+            hidden_states=fused_hidden,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+
+    def get_early_top_k_candidates(
+            self,
+            early_logits: torch.Tensor,
+            top_k: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get top-k candidates from early prediction logits.
+        
+        Args:
+            early_logits: (batch, seq_len, draft_vocab_size) - early prediction logits
+            top_k: number of top candidates to return (default: self.top_k)
+            
+        Returns:
+            Tuple of:
+                - topk_indices: (batch, seq_len, top_k) - indices of top-k tokens
+                - topk_probs: (batch, seq_len, top_k) - log probabilities of top-k tokens
+        """
+        if top_k is None:
+            top_k = self.top_k
+        
+        log_probs = self.logsoftmax(early_logits)
+        topk = torch.topk(log_probs, top_k, dim=-1)
+        return topk.indices, topk.values
+    # ============ End Early Prediction Methods ============
 
     def reset_kv(self):
         self.stable_kv = None
